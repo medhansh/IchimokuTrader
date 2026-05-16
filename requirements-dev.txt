@@ -1,0 +1,20 @@
+-r requirements.txt
+
+# Backtesting
+vectorbt>=0.26.0
+
+# ML (for regime research, not used in prod bot)
+scikit-learn>=1.4.0
+hmmlearn>=0.3.2
+
+# Dashboard
+streamlit>=1.35.0
+plotly>=5.22.0
+
+# Sentiment
+feedparser>=6.0.11
+vaderSentiment>=3.3.2
+
+# Dev / test
+pytest>=8.0.0
+matplotlib>=3.8.0
