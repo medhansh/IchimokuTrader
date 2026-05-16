@@ -158,11 +158,11 @@ def setup(gc: gspread.Client):
         ws.clear()
         return ws
 
-    wh = _tab(T_HOLDINGS);  wh.update("A1", [HOLDINGS_HDR]); wh.freeze(rows=1)
-    wp = _tab(T_PENDING);   wp.update("A1", [PENDING_HDR]);  wp.freeze(rows=1)
-    wt = _tab(T_TRANS);     wt.update("A1", [TRANS_HDR]);    wt.freeze(rows=1)
+    wh = _tab(T_HOLDINGS);  wh.update([HOLDINGS_HDR], "A1"); wh.freeze(rows=1)
+    wp = _tab(T_PENDING);   wp.update([PENDING_HDR], "A1");  wp.freeze(rows=1)
+    wt = _tab(T_TRANS);     wt.update([TRANS_HDR], "A1");    wt.freeze(rows=1)
     ws = _tab(T_SUMMARY, rows=30, cols=2)
-    ws.update("A1", SUMMARY_HDR)
+    ws.update(SUMMARY_HDR, "A1")
 
     # Remove default Sheet1 if it exists
     try: sh.del_worksheet(sh.worksheet("Sheet1"))
@@ -311,7 +311,7 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
     # Write Pending tab
     wp = sh.worksheet(T_PENDING)
     wp.clear()
-    wp.update("A1", [PENDING_HDR])
+    wp.update([PENDING_HDR], "A1")
     _fmt_header(wp, len(PENDING_HDR))
     if pending_rows:
         wp.append_rows(pending_rows, value_input_option="USER_ENTERED")
@@ -482,7 +482,7 @@ def run_fill(sh: gspread.Spreadsheet, manual_prices_str: str | None = None, forc
     # Clear Pending tab
     wp = sh.worksheet(T_PENDING)
     wp.clear()
-    wp.update("A1", [PENDING_HDR])
+    wp.update([PENDING_HDR], "A1")
     _fmt_header(wp, len(PENDING_HDR))
 
     _, regime = market_regime()
@@ -528,7 +528,7 @@ def _update_summary(sh: gspread.Spreadsheet, regime: str, regime_ok: bool):
     total_val = MAX_CAPITAL + real_pnl + unr
     total_ret = (total_val / MAX_CAPITAL - 1) * 100
 
-    ws.update("B2", [
+    ws.update([
         [round(total_val, 2)],
         [round(total_ret, 2)],
         [round(real_pnl, 2)],
@@ -542,7 +542,7 @@ def _update_summary(sh: gspread.Spreadsheet, regime: str, regime_ok: bool):
         [round(pf, 2)],
         [datetime.now().strftime("%Y-%m-%d %H:%M IST")],
         [f"{regime} ({'✓' if regime_ok else '✗'})"],
-    ], value_input_option="USER_ENTERED")
+    ], "B2", value_input_option="USER_ENTERED")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

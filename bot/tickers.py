@@ -79,7 +79,7 @@ _RAW = [
 
 # Deduplicate while preserving order
 _seen = set()
-NIFTY500 = [t for t in _RAW if not (_seen.add(t) or t in _seen)]
+NIFTY500 = [t for t in _RAW if t not in _seen and not _seen.add(t)]
 
 NIFTY50 = [
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
