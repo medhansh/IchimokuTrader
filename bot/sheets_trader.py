@@ -230,13 +230,16 @@ def _colour_row(ws: gspread.Worksheet, row: int, positive: bool):
 
 # ── EOD MODE ───────────────────────────────────────────────────────────────────
 
-def run_eod(sh: gspread.Spreadsheet):
+def run_eod(sh: gspread.Spreadsheet, force: bool = False):
     log.info(f"EOD MODE  |  {date.today()}")
 
     ok, reason = is_trading_day()
     if not ok:
-        log.warning(f"Not a trading day: {reason} — skipping EOD run")
-        return
+        if force:
+            log.warning(f"Not a trading day ({reason}) — running anyway due to --force")
+        else:
+            log.warning(f"Not a trading day: {reason} — skipping EOD run")
+            return
 
     regime_ok, regime = market_regime()
     log.info(f"Regime: {regime}  ({'entries ok' if regime_ok else 'entries blocked'})")
@@ -345,13 +348,16 @@ def _update_prices(sh: gspread.Spreadsheet, data: dict):
 
 # ── FILL MODE ──────────────────────────────────────────────────────────────────
 
-def run_fill(sh: gspread.Spreadsheet, manual_prices_str: str | None = None):
+def run_fill(sh: gspread.Spreadsheet, manual_prices_str: str | None = None, force: bool = False):
     log.info(f"FILL MODE  |  {date.today()}")
 
     ok, reason = is_trading_day()
     if not ok:
-        log.warning(f"Not a trading day: {reason} — pending orders carry over")
-        return
+        if force:
+            log.warning(f"Not a trading day ({reason}) — running anyway due to --force")
+        else:
+            log.warning(f"Not a trading day: {reason} — pending orders carry over")
+            return
 
     yesterday = date.today() - timedelta(days=1)
     y_ok, y_reason = is_trading_day(yesterday)
@@ -546,6 +552,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["setup", "eod", "fill"], default="eod")
     parser.add_argument("--open-prices", default=None,
                         help="TCS:3920,INFY:1845 — override auto-fetch")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass holiday/weekend check (for manual seeding runs)")
     args = parser.parse_args()
 
     gc = get_client()
@@ -555,6 +563,6 @@ if __name__ == "__main__":
     else:
         sh = open_sheet(gc)
         if args.mode == "eod":
-            run_eod(sh)
+            run_eod(sh, force=args.force)
         elif args.mode == "fill":
-            run_fill(sh, args.open_prices)
+            run_fill(sh, args.open_prices, force=args.force)

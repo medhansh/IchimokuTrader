@@ -6,7 +6,7 @@ Self-contained — only numpy, pandas, yfinance.
 No sklearn, no hmmlearn.
 """
 
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -43,10 +43,13 @@ MUHURAT_DAYS = {
 def is_trading_day(check: date | None = None) -> tuple[bool, str]:
     """
     Returns (True, "") if NSE is open for normal trading.
-    Returns (False, reason) if closed.
+    Always uses IST (UTC+5:30) — GitHub Actions runs in UTC
+    so date.today() would return the wrong date without this.
     """
     if check is None:
-        check = date.today()
+        from datetime import timezone, timedelta as td
+        ist   = timezone(td(hours=5, minutes=30))
+        check = datetime.now(ist).date()
 
     if check.weekday() >= 5:
         return False, f"Weekend ({check.strftime('%A')})"
