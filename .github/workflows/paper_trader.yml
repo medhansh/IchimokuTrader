@@ -18,6 +18,12 @@ on:
         description: "Manual open prices for fill mode: TCS:3920,INFY:1845"
         required: false
         default: ""
+      force:
+        description: "Bypass holiday check (for weekend seeding runs)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 jobs:
   trade:
@@ -72,7 +78,11 @@ jobs:
           echo "Mode: $MODE | $(TZ='Asia/Kolkata' date)"
 
           if [ -n "$PRICES" ] && [ "$MODE" = "fill" ]; then
-            python -m bot.sheets_trader --mode "$MODE" --open-prices "$PRICES"
+            FORCE_FLAG=""
+            [ "${{ github.event.inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+            python -m bot.sheets_trader --mode "$MODE" --open-prices "$PRICES" $FORCE_FLAG
           else
-            python -m bot.sheets_trader --mode "$MODE"
+            FORCE_FLAG=""
+            [ "${{ github.event.inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+            python -m bot.sheets_trader --mode "$MODE" $FORCE_FLAG
           fi
