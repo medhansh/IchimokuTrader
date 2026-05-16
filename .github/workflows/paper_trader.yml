@@ -1,0 +1,88 @@
+name: Paper Trader
+
+on:
+  schedule:
+    # 9:20 AM IST = 3:50 AM UTC → fill pending orders at market open
+    - cron: "50 3 * * 1-5"
+    # 4:00 PM IST = 10:30 AM UTC → EOD signal generation after market close
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode"
+        required: true
+        default: "eod"
+        type: choice
+        options: [eod, fill, setup]
+      open_prices:
+        description: "Manual open prices for fill mode: TCS:3920,INFY:1845"
+        required: false
+        default: ""
+      force:
+        description: "Bypass holiday check (for weekend seeding runs)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine mode
+        id: ctx
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}"        >> $GITHUB_OUTPUT
+            echo "prices=${{ github.event.inputs.open_prices }}" >> $GITHUB_OUTPUT
+          else
+            HOUR=$(date -u +%H)
+            [ "$HOUR" = "03" ] && MODE="fill" || MODE="eod"
+            echo "mode=$MODE"  >> $GITHUB_OUTPUT
+            echo "prices="     >> $GITHUB_OUTPUT
+          fi
+
+      - name: Debug secrets presence
+        run: |
+          echo "GSHEET_ID set: ${{ secrets.GSHEET_ID != '' }}"
+          echo "GSHEET_CREDENTIALS set: ${{ secrets.GSHEET_CREDENTIALS != '' }}"
+          python -c "import os; print('GSHEET_ID len:', len(os.getenv('GSHEET_ID','')))"
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+
+      - name: Run ${{ steps.ctx.outputs.mode }}
+        env:
+          GSHEET_CREDENTIALS: ${{ secrets.GSHEET_CREDENTIALS }}
+          GSHEET_ID:          ${{ secrets.GSHEET_ID }}
+          GSHEET_NAME:        ${{ secrets.GSHEET_NAME }}
+          MAX_CAPITAL:        "200000"
+          MAX_POSITIONS:      "8"
+          RISK_PER_TRADE:     "0.02"
+        run: |
+          MODE="${{ steps.ctx.outputs.mode }}"
+          PRICES="${{ steps.ctx.outputs.prices }}"
+          echo "Mode: $MODE | $(TZ='Asia/Kolkata' date)"
+
+          if [ -n "$PRICES" ] && [ "$MODE" = "fill" ]; then
+            FORCE_FLAG=""
+            [ "${{ github.event.inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+            python -m bot.sheets_trader --mode "$MODE" --open-prices "$PRICES" $FORCE_FLAG
+          else
+            FORCE_FLAG=""
+            [ "${{ github.event.inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+            python -m bot.sheets_trader --mode "$MODE" $FORCE_FLAG
+          fi
