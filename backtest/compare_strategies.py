@@ -270,6 +270,21 @@ def run_backtest(
             for ticker, score_val in candidates[:slots]:
                 close = float(data[ticker].loc[dt, "Close"])
 
+                # ── Momentum quality filter ────────────────────────────────────
+                # Require close > MA100 and MA100 > MA200 * 0.97
+                # Rejects bounces in structural downtrends
+                try:
+                    hist  = data[ticker][data[ticker].index <= dt]
+                    c_ser = hist["Close"] if isinstance(hist["Close"], pd.Series) \
+                            else hist["Close"].iloc[:, 0]
+                    if len(c_ser) >= 200:
+                        ma100 = float(c_ser.rolling(100).mean().iloc[-1])
+                        ma200 = float(c_ser.rolling(200).mean().iloc[-1])
+                        if not (close > ma100 and ma100 > ma200 * 0.97):
+                            continue   # skip — structural downtrend
+                except Exception:
+                    pass  # insufficient history — allow through
+
                 # ── Position sizing ────────────────────────────────────────
                 # Capital allocation: equal slot per position
                 # ATR determines stop placement, not share count
@@ -414,8 +429,8 @@ def plot_comparison(all_results: list[dict], save_path: Path):
 def print_table(all_results: list[dict]):
     regimes = ["Real Historical", "Bear Market", "Declining Synthetic", "Random Noise"]
     print(f"\n{'═'*88}")
-    print(f"  STRATEGY COMPARISON  |  Equal slot capital + ATR-based stops")
-    print(f"  Capital per slot = portfolio / max_positions  |  Stop = entry - 2.5×ATR")
+    print(f"  STRATEGY COMPARISON  |  Equal slot capital + ATR stops + MA100/200 filter")
+    print(f"  Entry requires: score crossover AND close > MA100 > MA200×0.97")
     print(f"{'─'*88}")
     print(f"  {'Regime':<24}  {'Strategy':<14}  {'Return':>8}  {'CAGR':>7}  "
           f"{'Sharpe':>7}  {'MDD':>7}  {'WinRate':>8}  {'Trades':>7}  {'AvgRisk':>8}")
