@@ -44,8 +44,9 @@ from google.oauth2.service_account import Credentials
 from bot.data    import fetch_all_daily, fetch_open_price
 from bot.regime  import is_trading_day, market_regime
 from bot.tickers import NIFTY500
-from strategy.indicators import atr_latest
-from strategy.signals    import latest_score, entry_signal, exit_signal, size_position, SCORE_BUY, SCORE_SELL
+from strategy.indicators      import atr_latest
+from strategy.signals         import entry_signal, exit_signal, SCORE_SELL
+from strategy.adaptive_signals import adaptive_latest_score
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +63,13 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS",   "8"))
 RISK_PCT      = float(os.getenv("RISK_PER_TRADE","0.02"))
 COMMISSION    = 0.001
 ATR_TRAIL     = 2.5
+
+# Adaptive strategy uses a lower entry threshold because the WHT multiplier
+# scales scores below the original 0.40 level. Calibrated from backtesting.
+SCORE_ENTRY   = float(os.getenv("SCORE_THRESHOLD", "0.25"))  # adaptive entry
+# Exit threshold stays symmetric but uses original scale (WHT doesn't affect exits
+# since we exit on score crossing negative threshold from above)
+SCORE_EXIT_THRESH = -SCORE_ENTRY
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -252,13 +260,14 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
     pending_rows  = []
 
     for ticker, df in data.items():
-        score_now, score_prev = latest_score(df)
-        close  = float(df["Close"].iloc[-1] if "Close" in df.columns else 0)
+        score_now, score_prev = adaptive_latest_score(df)   # ← adaptive FFT+WHT
+        close  = float(df["Close"].iloc[-1] if isinstance(df["Close"], pd.Series)
+                       else df["Close"].iloc[-1, 0])
         atr_v  = atr_latest(df)
         in_pos = ticker in open_tickers
 
         if in_pos:
-            # Check trailing stop
+            # Check trailing stop from Holdings sheet
             stop = None
             if not holdings_df.empty and "Stop Level" in holdings_df.columns:
                 row = holdings_df[
@@ -269,8 +278,8 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
                     try: stop = float(row["Stop Level"].iloc[0])
                     except Exception: pass
 
-            stop_hit   = stop is not None and close < stop
-            score_exit_ = exit_signal(score_now, score_prev)
+            stop_hit    = stop is not None and close < stop
+            score_exit_ = score_now <= SCORE_EXIT_THRESH and score_prev > SCORE_EXIT_THRESH
 
             if stop_hit or score_exit_:
                 shares = 0
@@ -287,14 +296,19 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
                     "", "",
                 ])
         else:
-            if regime_ok and entry_signal(score_now, score_prev):
-                shares = size_position(close, atr_v, score_now, MAX_CAPITAL,
-                                       risk_pct=RISK_PCT, atr_multiplier=ATR_TRAIL)
+            # Entry: adaptive crossover
+            if regime_ok and score_now >= SCORE_ENTRY and score_prev < SCORE_ENTRY:
+                # Equal slot sizing: deploy 1/max_positions of capital per slot
+                # ATR sets the stop level (risk), not the share count
+                slot_capital = MAX_CAPITAL / MAX_POSITIONS
+                shares       = max(1, int(slot_capital / close))
+                stop_level   = round(close - atr_v * ATR_TRAIL, 2)
                 if shares >= 1:
                     pending_rows.append([
                         ticker, date.today().isoformat(), "BUY",
                         round(close, 2), shares, round(close * shares, 2),
-                        round(score_now, 4), round(atr_v, 2), "score_entry",
+                        round(score_now, 4), round(atr_v, 2),
+                        f"score_entry stop={stop_level}",
                         "", "",
                     ])
 
