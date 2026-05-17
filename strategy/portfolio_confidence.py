@@ -35,10 +35,12 @@ import pandas as pd
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-BASE_THRESHOLD  = 0.25    # baseline entry threshold (from backtest optimisation)
-MAX_THRESHOLD   = 0.45    # ceiling — never block all entries
-SENSITIVITY     = 2.0     # how much threshold rises per unit of negative return
-                          # e.g. sensitivity=2: down 2% → threshold += 0.04
+BASE_THRESHOLD  = 0.25    # baseline entry threshold
+MAX_THRESHOLD   = 0.45    # ceiling
+SENSITIVITY     = 8.0     # convex scaling factor
+CONVEXITY       = 1.5     # exponent — makes small losses barely matter,
+                          # large losses spike the threshold hard
+                          # penalty = max(0, -return)^CONVEXITY * SENSITIVITY
 LOOKBACK_BARS   = 5       # recent performance window (1 trading week)
 
 
@@ -65,10 +67,12 @@ class PortfolioThreshold:
                  base:        float = BASE_THRESHOLD,
                  max_thresh:  float = MAX_THRESHOLD,
                  sensitivity: float = SENSITIVITY,
+                 convexity:   float = CONVEXITY,
                  lookback:    int   = LOOKBACK_BARS):
         self.base        = base
         self.max_thresh  = max_thresh
         self.sensitivity = sensitivity
+        self.convexity   = convexity
         self.lookback    = lookback
         self._history: list[float] = []   # rolling portfolio values
 
@@ -89,13 +93,24 @@ class PortfolioThreshold:
 
     def current_threshold(self) -> float:
         """
-        Compute effective entry threshold for the current bar.
+        Compute effective entry threshold.
 
-        threshold = base + max(0, -recent_return) * sensitivity
-        clamped to [base, max_threshold]
+        Uses convex (power-law) penalty so small weekly losses barely
+        affect the threshold, but large losses spike it aggressively:
+
+            penalty = max(0, -recent_return)^CONVEXITY × SENSITIVITY
+
+        Examples (CONVEXITY=1.5, SENSITIVITY=8):
+            Portfolio -0.5% last week → penalty ≈ 0.003  → threshold 0.253
+            Portfolio -1%   last week → penalty ≈ 0.008  → threshold 0.258
+            Portfolio -2%   last week → penalty ≈ 0.023  → threshold 0.273
+            Portfolio -4%   last week → penalty ≈ 0.064  → threshold 0.314
+            Portfolio -6%   last week → penalty ≈ 0.117  → threshold 0.367
+            Portfolio -8%   last week → penalty ≈ 0.181  → threshold 0.431
         """
         r       = self.recent_return()
-        penalty = max(0.0, -r) * self.sensitivity
+        loss    = max(0.0, -r)
+        penalty = (loss ** self.convexity) * self.sensitivity
         return float(np.clip(self.base + penalty, self.base, self.max_thresh))
 
     def state_dict(self) -> dict:
@@ -104,6 +119,7 @@ class PortfolioThreshold:
             "base":        self.base,
             "max_thresh":  self.max_thresh,
             "sensitivity": self.sensitivity,
+            "convexity":   self.convexity,
             "lookback":    self.lookback,
         }
 
@@ -113,6 +129,7 @@ class PortfolioThreshold:
             base        = d.get("base",        BASE_THRESHOLD),
             max_thresh  = d.get("max_thresh",  MAX_THRESHOLD),
             sensitivity = d.get("sensitivity", SENSITIVITY),
+            convexity   = d.get("convexity",   CONVEXITY),
             lookback    = d.get("lookback",    LOOKBACK_BARS),
         )
         pt._history = d.get("history", [])

@@ -433,7 +433,8 @@ def print_table(results_by_regime: dict):
     print(f"\n{'═'*100}")
     print(f"  Adaptive (baseline) vs Adaptive + Portfolio Confidence")
     print(f"  Entry threshold rises when portfolio has had a bad recent week")
-    print(f"  threshold(t) = 0.25 + max(0, -return_5d) × 2.0  clamped to [0.25, 0.45]")
+    print(f"  threshold(t) = 0.25 + max(0, -return_5d)^1.5 × 8.0  clamped to [0.25, 0.45]")
+    print(f"  Convex penalty: -1% → +0.008, -3% → +0.042, -6% → +0.117, -8% → +0.181")
     print(f"{'─'*100}")
     print(f"  {'Regime':<28}  {'Strategy':<34}  "
           f"{'Return':>8}  {'CAGR':>7}  {'Sharpe':>7}  "
