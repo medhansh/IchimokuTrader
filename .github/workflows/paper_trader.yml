@@ -72,6 +72,7 @@ jobs:
           MAX_CAPITAL:        "200000"
           MAX_POSITIONS:      "8"
           RISK_PER_TRADE:     "0.02"
+          SCORE_THRESHOLD:    "0.25"
         run: |
           MODE="${{ steps.ctx.outputs.mode }}"
           PRICES="${{ steps.ctx.outputs.prices }}"
