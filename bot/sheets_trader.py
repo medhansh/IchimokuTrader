@@ -298,8 +298,27 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
         else:
             # Entry: adaptive crossover
             if regime_ok and score_now >= SCORE_ENTRY and score_prev < SCORE_ENTRY:
+                # ── Momentum quality filter ────────────────────────────────────
+                # Reject entries where the stock is in a structural downtrend.
+                # A stock below its 200-day MA in a declining trend should not
+                # be entered just because it has a local bounce signal.
+                # Require: close > 100-day SMA (medium-term uptrend confirmed)
+                try:
+                    close_series = df["Close"] if isinstance(df["Close"], pd.Series) \
+                                   else df["Close"].iloc[:, 0]
+                    ma100 = float(close_series.rolling(100).mean().iloc[-1])
+                    ma200 = float(close_series.rolling(200).mean().iloc[-1])
+                    # Price must be above MA100 and MA100 must be above MA200
+                    # (medium-term uptrend, not a bounce in a downtrend)
+                    in_uptrend = (close > ma100) and (ma100 > ma200 * 0.97)
+                    if not in_uptrend:
+                        log.debug(f"  {ticker}: rejected — below MA100/200 "
+                                  f"(close={close:.0f} ma100={ma100:.0f} ma200={ma200:.0f})")
+                        continue
+                except Exception:
+                    pass  # insufficient data for MA — allow through
+
                 # Equal slot sizing: deploy 1/max_positions of capital per slot
-                # ATR sets the stop level (risk), not the share count
                 slot_capital = MAX_CAPITAL / MAX_POSITIONS
                 shares       = max(1, int(slot_capital / close))
                 stop_level   = round(close - atr_v * ATR_TRAIL, 2)
