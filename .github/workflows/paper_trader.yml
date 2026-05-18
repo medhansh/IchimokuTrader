@@ -1,6 +1,7 @@
 name: Paper Trader
 
 on:
+# Scheduled: fill 9:20 AM IST, EOD 4:00 PM IST
   schedule:
     # 9:20 AM IST = 3:50 AM UTC → fill pending orders at market open
     - cron: "50 3 * * 1-5"
