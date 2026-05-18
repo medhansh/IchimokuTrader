@@ -1,12 +1,6 @@
 name: Paper Trader
 
 on:
-# Scheduled: fill 9:20 AM IST, EOD 4:00 PM IST
-  schedule:
-    # 9:20 AM IST = 3:50 AM UTC → fill pending orders at market open
-    - cron: "50 3 * * 1-5"
-    # 4:00 PM IST = 10:30 AM UTC → EOD signal generation after market close
-    - cron: "30 10 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
