@@ -351,7 +351,12 @@ def _write_signal_radar(
     ]], "A3", value_input_option="USER_ENTERED")
 
     # Format header rows
-    _fmt_header(ws, 3, 13)
+    ws.format("F3:M3", {
+        "backgroundColor": {"red": 0.07, "green": 0.07, "blue": 0.12},
+        "textFormat": {"bold": True,
+                       "foregroundColor": {"red": 0.0, "green": 0.83, "blue": 0.67}},
+        "horizontalAlignment": "CENTER",
+    })
     ws.format("A1:E1", {
         "backgroundColor": {"red": 0.07, "green": 0.07, "blue": 0.15},
         "textFormat": {"bold": True,
