@@ -81,6 +81,7 @@ T_HOLDINGS = "Holdings"
 T_PENDING  = "Pending"
 T_TRANS    = "Transactions"
 T_SUMMARY  = "Summary"
+T_SIGNALS  = "Signal Radar"    # diagnostic tab — top scores every EOD run
 
 HOLDINGS_HDR = [
     "Ticker", "Entry Date", "Fill Price", "Signal Price",
@@ -172,6 +173,15 @@ def setup(gc: gspread.Client):
     ws = _tab(T_SUMMARY, rows=30, cols=2)
     ws.update(SUMMARY_HDR, "A1")
 
+    # Signal Radar tab
+    sr = _tab(T_SIGNALS, rows=50, cols=12)
+    sr.update([[
+        "As of", "Regime", "Entries Allowed", "Stocks Above MA100/200",
+        "", "Ticker", "Score", "Prev Score", "Close", "MA100", "MA200",
+        "MA Filter", "Blocked By",
+    ]], "A1")
+    sr.freeze(rows=2)
+
     # Remove default Sheet1 if it exists
     try: sh.del_worksheet(sh.worksheet("Sheet1"))
     except Exception: pass
@@ -237,6 +247,154 @@ def _colour_row(ws: gspread.Worksheet, row: int, positive: bool):
 
 
 # ── EOD MODE ───────────────────────────────────────────────────────────────────
+
+def _write_signal_radar(
+    sh:         gspread.Spreadsheet,
+    data:       dict,
+    regime:     str,
+    regime_ok:  bool,
+    open_tickers: set,
+    top_n:      int = 30,
+):
+    """
+    Write a diagnostic snapshot to the Signal Radar tab.
+
+    Shows the top 30 stocks by score with:
+        - Why each was blocked (regime / MA filter / below threshold / no crossover)
+        - How close each is to triggering (score vs threshold)
+        - MA100/200 status so you can see how many stocks are in uptrends
+
+    This updates every EOD run so you can track market conditions
+    over time even when no signals fire.
+    """
+    rows = []
+    for ticker, df in data.items():
+        if ticker in open_tickers:
+            continue   # already holding — skip
+        try:
+            score_now, score_prev = adaptive_latest_score(df)
+            close_series = df["Close"] if isinstance(df["Close"], pd.Series) \
+                           else df["Close"].iloc[:, 0]
+            close = float(close_series.iloc[-1])
+            ma100 = float(close_series.rolling(100).mean().iloc[-1])
+            ma200 = float(close_series.rolling(200).mean().iloc[-1])
+
+            ma_pass = close > ma100 and ma100 > ma200 * 0.97
+            crossover = score_now >= SCORE_ENTRY and score_prev < SCORE_ENTRY
+
+            # Determine what's blocking this stock
+            if not regime_ok:
+                blocked = "Regime"
+            elif not ma_pass:
+                blocked = f"MA (close={close:.0f} < ma100={ma100:.0f})" \
+                          if close <= ma100 else f"MA (ma100={ma100:.0f} < ma200={ma200:.0f})"
+            elif not crossover:
+                if score_now >= SCORE_ENTRY:
+                    blocked = f"Already above thresh (no new crossover)"
+                elif score_now >= SCORE_ENTRY * 0.75:
+                    blocked = f"Near threshold ({score_now:.3f} vs {SCORE_ENTRY})"
+                else:
+                    blocked = f"Score too low ({score_now:.3f})"
+            else:
+                blocked = "NONE — would fire if MA passes"  # shouldn't reach here
+
+            rows.append({
+                "ticker":    ticker,
+                "score":     round(score_now, 4),
+                "prev":      round(score_prev, 4),
+                "close":     round(close, 2),
+                "ma100":     round(ma100, 2),
+                "ma200":     round(ma200, 2),
+                "ma_pass":   "✓" if ma_pass else "✗",
+                "blocked":   blocked,
+                "crossover": crossover,
+            })
+        except Exception as e:
+            log.debug(f"  Radar: {ticker} failed: {e}")
+
+    if not rows:
+        return
+
+    # Sort by score descending — highest conviction stocks first
+    rows.sort(key=lambda r: -r["score"])
+    top = rows[:top_n]
+
+    n_ma_pass    = sum(1 for r in rows if r["ma_pass"] == "✓")
+    n_near_thresh= sum(1 for r in rows if r["score"] >= SCORE_ENTRY * 0.75)
+
+    try:
+        ws = sh.worksheet(T_SIGNALS)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(T_SIGNALS, rows=50, cols=13)
+
+    ws.clear()
+
+    # Header rows
+    ws.update([[
+        "As of", "Regime", "Entries", "Stocks above MA100/200",
+        "Near threshold (>75%)", "", "", "", "", "", "", "", "",
+    ]], "A1", value_input_option="USER_ENTERED")
+
+    ws.update([[
+        datetime.now().strftime("%Y-%m-%d %H:%M IST"),
+        regime,
+        "✓ OK" if regime_ok else "✗ BLOCKED",
+        f"{n_ma_pass} / {len(rows)}",
+        str(n_near_thresh),
+        "", "", "", "", "", "", "", "",
+    ]], "A2", value_input_option="USER_ENTERED")
+
+    ws.update([[
+        "", "", "", "", "",
+        "Ticker", "Score", "Prev Score", "Close",
+        "MA100", "MA200", "MA Filter", "Blocked By",
+    ]], "A3", value_input_option="USER_ENTERED")
+
+    # Format header rows
+    _fmt_header(ws, 3, 13)
+    ws.format("A1:E1", {
+        "backgroundColor": {"red": 0.07, "green": 0.07, "blue": 0.15},
+        "textFormat": {"bold": True,
+                       "foregroundColor": {"red": 0.8, "green": 0.8, "blue": 0.9}},
+    })
+
+    # Data rows
+    data_rows = []
+    for r in top:
+        # Colour-code: green if near threshold + MA passes, red if far away
+        data_rows.append([
+            "", "", "", "", "",
+            r["ticker"],
+            r["score"],
+            r["prev"],
+            r["close"],
+            r["ma100"],
+            r["ma200"],
+            r["ma_pass"],
+            r["blocked"],
+        ])
+
+    if data_rows:
+        ws.append_rows(data_rows, value_input_option="USER_ENTERED")
+
+        # Colour rows by proximity to firing
+        for i, r in enumerate(top):
+            row_num = i + 4   # rows 1,2,3 are header
+            if r["ma_pass"] == "✓" and r["score"] >= SCORE_ENTRY * 0.80:
+                # Close to firing — green tint
+                bg = {"red": 0.05, "green": 0.20, "blue": 0.10}
+            elif r["ma_pass"] == "✗":
+                # MA filter blocking — red tint
+                bg = {"red": 0.20, "green": 0.05, "blue": 0.05}
+            else:
+                # Default dark
+                bg = {"red": 0.07, "green": 0.07, "blue": 0.12}
+            ws.format(f"A{row_num}:M{row_num}", {"backgroundColor": bg})
+
+    log.info(f"[RADAR]  {n_ma_pass}/{len(rows)} stocks above MA  |  "
+             f"{n_near_thresh} near threshold  |  "
+             f"Top score: {rows[0]['score']:.3f} ({rows[0]['ticker']})")
+
 
 def run_eod(sh: gspread.Spreadsheet, force: bool = False):
     log.info(f"EOD MODE  |  {date.today()}")
@@ -348,7 +506,6 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
     _fmt_header(wp, len(PENDING_HDR))
     if pending_rows:
         wp.append_rows(pending_rows, value_input_option="USER_ENTERED")
-        # Yellow fill-price column
         import gspread.utils as gu
         fill_col = PENDING_HDR.index("Fill Price (leave blank for auto-fetch)") + 1
         col_letter = gu.rowcol_to_a1(1, fill_col).rstrip("0123456789")
@@ -357,6 +514,9 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
             "textFormat": {"bold": True,
                            "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}},
         })
+
+    # Write Signal Radar diagnostic tab
+    _write_signal_radar(sh, data, regime, regime_ok, open_tickers)
 
     _update_summary(sh, regime, regime_ok)
 
