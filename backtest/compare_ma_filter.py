@@ -4,14 +4,14 @@ backtest/compare_ma_filter.py
 3-way comparison on the same adaptive signal (adaptive_signals.py):
 
     Strategy A  — Hard MA filter (current sheets_trader behaviour)
-                  Requires close > MA100 AND MA100 > MA200 * 0.97
+                 Requires close > MA100 AND MA100 > MA200 * 0.97
 
     Strategy B  — Tiered MA filter (Option 2)
-                  threshold = BASE + max(0, -ma_gap) * SENSITIVITY
-                  Hard block only if stock > 30% below MA100
+                 threshold = BASE + max(0, -ma_gap) * SENSITIVITY
+                 Hard block only if stock > 30% below MA100
 
     Strategy C  — No MA filter (raw adaptive signal)
-                  Pure score crossover at fixed 0.25 threshold
+                 Pure score crossover at fixed 0.25 threshold
 
 Run:
     python -m backtest.compare_ma_filter
@@ -39,7 +39,8 @@ import matplotlib.gridspec as gridspec
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot.data    import fetch_ohlcv
+# FIXED: Changed fetch_ohlcv to fetch_daily to match bot/data.py
+from bot.data    import fetch_daily
 from bot.tickers import NIFTY500
 from strategy.adaptive_signals  import adaptive_latest_score   # noqa: F401 (import check)
 from strategy.tiered_ma_signals import (
@@ -91,9 +92,6 @@ def _compute_scores_for_ticker(df: pd.DataFrame) -> pd.Series:
     Imports the heavy computation from adaptive_signals.
     Returns a Series indexed like df.
     """
-    # We need the full vectorised score. adaptive_signals.adaptive_latest_score
-    # only returns the last two values — we need the full series for the backtester.
-    # Re-implement the core scoring here using the same indicators.
     from strategy.indicators import (
         ichimoku, vidya, volume_weighted_rsi, atr, adx,
     )
@@ -142,7 +140,7 @@ def _compute_scores_for_ticker(df: pd.DataFrame) -> pd.Series:
     s3 = np.tanh((close - cloud_mid) / (cloud_top - cloud_bot + 1e-9) * 2)
 
     # s4 — chikou confirmation
-    s4 = np.tanh((chikou - close.shift(disp_p)) / (close + 1e-9) * 10)
+    s4 = np.tanh((chikou - close.shift(disp_p)) / (close + 1e-9) * 10).fillna(0)
 
     # s5 — VIDYA trend
     vid_short = vidya(close, period=tenkan_p)
@@ -154,6 +152,7 @@ def _compute_scores_for_ticker(df: pd.DataFrame) -> pd.Series:
     s6   = np.tanh((vrsi - 50) / 25)
 
     raw_score = s1 + s2 + s3 + s4 + s5 + s6
+    raw_score = raw_score.fillna(0)
 
     # WHT multiplier
     try:
@@ -194,30 +193,25 @@ def _run_backtest(
     strategy_name: str,
     ticker_data: dict[str, pd.DataFrame],
     score_data:  dict[str, pd.Series],
-    entry_filter_fn,      # (ticker, date, close, score, score_prev, df) -> bool
-    thresh_fn,            # (ticker, date, close, df) -> float  (the threshold to use)
+    entry_filter_fn,      
+    thresh_fn,            
 ) -> tuple[pd.DataFrame, dict]:
-    """
-    Generic event-driven backtest.
-
-    entry_filter_fn(ticker, date, close_val, score, score_prev, df) → bool
-        Return True if the stock is allowed to be entered on this bar.
-
-    thresh_fn(ticker, date, close_val, df) → float
-        Return the entry threshold for this bar.
-    """
+    
     all_dates = sorted(set(
         d for df in ticker_data.values()
         for d in df.index
         if TEST_START <= str(d)[:10] <= TEST_END
     ))
+    
+    if not all_dates:
+        print(f"[-] Error: No overlapping dates found in test range for {strategy_name}.")
+        return pd.DataFrame(columns=["equity"]), {}
 
     cash       = float(INIT_CAPITAL)
     positions: dict[str, Position] = {}
     equity_curve = []
     trades_log   = []
 
-    # Pre-slice data to test period for speed
     test_data  = {t: df.loc[df.index >= TEST_START] for t, df in ticker_data.items()}
     test_score = {t: sc.loc[sc.index >= TEST_START]  for t, sc in score_data.items()}
 
@@ -298,20 +292,16 @@ def _run_backtest(
 
             close_val = float(_col(df, "Close").loc[date])
 
-            # Get the effective threshold for this bar
             eff_thresh = thresh_fn(t, date, close_val, df)
             if eff_thresh == float("inf"):
                 continue
 
-            # Fresh crossover above threshold
             if not (score_prev < eff_thresh <= score_val):
                 continue
 
-            # Custom filter (regime, etc.)
             if not entry_filter_fn(t, date, close_val, score_val, score_prev, df):
                 continue
 
-            # Position sizing: equal slot capital
             shares = max(1, int(slot_capital / close_val))
             cost   = shares * close_val * (1 + SLIPPAGE)
             if cost > cash:
@@ -325,7 +315,6 @@ def _run_backtest(
             cash      -= cost
             positions[t] = Position(t, close_val, shares, stop_price, date)
 
-    # Force-close remaining at end
     final_date = all_dates[-1]
     for t, pos in positions.items():
         df = test_data.get(t)
@@ -387,7 +376,6 @@ def _run_backtest(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_hard_filter(ticker_data):
-    """Strategy A: hard MA100/200 gate (current sheets_trader logic)."""
     def filter_fn(ticker, date, close_val, score, score_prev, df):
         close_s = _col(df, "Close")
         ma100 = close_s.rolling(100).mean()
@@ -403,12 +391,10 @@ def _make_hard_filter(ticker_data):
 
 
 def _hard_thresh_fn(ticker, date, close_val, df):
-    """Strategy A uses a fixed threshold — the hard filter is separate."""
     return SCORE_THRESH
 
 
 def _make_tiered_thresh_fn(ticker_data):
-    """Strategy B: threshold computed from tiered MA distance."""
     def thresh_fn(ticker, date, close_val, df):
         close_s = _col(df, "Close")
         ma100 = float(close_s.rolling(100).mean().get(date, np.nan))
@@ -418,7 +404,6 @@ def _make_tiered_thresh_fn(ticker_data):
 
 
 def _tiered_entry_fn(ticker, date, close_val, score, score_prev, df):
-    """Strategy B: no separate filter — the threshold does all the work."""
     return True
 
 
@@ -436,8 +421,15 @@ def _no_filter_entry_fn(ticker, date, close_val, score, score_prev, df):
 
 def _fetch_nifty_benchmark() -> pd.Series:
     try:
-        df = fetch_ohlcv("^NSEI", period="10y", interval="1d")
-        close = _col(df, "Close")
+        # Pass a custom manual download to avoid adding duplicate .NS to the index
+        raw = yf.download(
+            "^NSEI", period="7y", interval="1d",
+            auto_adjust=True, progress=False, timeout=15,
+        )
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw.loc[:, ~raw.columns.duplicated()].sort_index()
+        close = _col(raw, "Close")
         return close.loc[close.index >= TEST_START]
     except Exception:
         return pd.Series(dtype=float)
@@ -492,33 +484,68 @@ def _plot(equity_curves: dict[str, pd.DataFrame], nifty: pd.Series, outpath: Pat
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    import yfinance as yf
     # ── 1. Fetch data ─────────────────────────────────────────────────────────
     print(f"\nFetching data for {len(TICKERS)} tickers from {TRAIN_START} …")
     ticker_data: dict[str, pd.DataFrame] = {}
     failed = 0
     for i, t in enumerate(TICKERS):
         try:
-            df = fetch_ohlcv(t, period="7y", interval="1d")
-            if df is not None and len(df) > 300:
-                ticker_data[t] = df
-        except Exception:
+            raw = yf.download(
+                t + ".NS", period="7y", interval="1d",
+                auto_adjust=True, progress=False, timeout=15,
+            )
+            
+            # --- ADDED: Flatten MultiIndex columns if present ---
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            raw = raw.loc[:, ~raw.columns.duplicated()].sort_index()
+            # -----------------------------------------------------
+
+            if not raw.empty:
+                df = raw.dropna(subset=["Close"])
+                if df is not None and len(df) > 300:
+                    ticker_data[t] = df
+                else:
+                    failed += 1
+            else:
+                failed += 1
+        except Exception as e:
+            # Helpful debugging print so we aren't completely blind if something else breaks
+            # print(f"Error on {t}: {e}") 
             failed += 1
+            
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{len(TICKERS)}  loaded={len(ticker_data)}  failed={failed}")
-        time.sleep(0.05)
+        time.sleep(0.1) # Slightly increased delay to respect Yahoo API limits
 
     print(f"\nLoaded {len(ticker_data)} tickers  ({failed} failed)")
 
-    # ── 2. Compute scores ─────────────────────────────────────────────────────
     print("\nComputing adaptive scores … (this takes a few minutes)")
     score_data: dict[str, pd.Series] = {}
+    
+    # Track error counts to diagnose what is breaking
+    error_samples = 0
+    
     for i, (t, df) in enumerate(ticker_data.items()):
         try:
+            # FORCE DATETIME TO BE NAIVE (Fixes potential timezone matching issues with strings)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+                
             sc = _compute_scores_for_ticker(df)
-            if sc.dropna().__len__() > 50:
+            
+            # Use count() instead of dropna().__len__() to see if data exists
+            if sc.count() > 50:
                 score_data[t] = sc
         except Exception as e:
+            if error_samples < 3:
+                print(f"\n[!] Error calculating score for {t}:")
+                import traceback
+                traceback.print_exc()
+                error_samples += 1
             pass
+            
         if (i + 1) % 50 == 0:
             print(f"  scored {i+1}/{len(ticker_data)}")
 
@@ -526,7 +553,6 @@ def main():
 
     valid = {t: ticker_data[t] for t in score_data}
 
-    # ── 3. Run strategies ─────────────────────────────────────────────────────
     nifty = _fetch_nifty_benchmark()
 
     strategies = [
@@ -544,7 +570,6 @@ def main():
         equity_curves[name] = eq
         all_metrics.append(metrics)
 
-    # ── 4. Print results table ────────────────────────────────────────────────
     col_w = {
         "strategy": 26, "total_return": 12, "cagr": 10,
         "sharpe": 8, "mdd": 10, "calmar": 8, "win_rate": 9, "trades": 7,
@@ -562,33 +587,33 @@ def main():
     print(f"{'─' * len(sep)}")
 
     for m in all_metrics:
+        if not m: # Skip empty metrics dictionary if backtest failed
+            continue
         row = "  " + "  ".join(str(m[h]).ljust(col_w[h]) for h in headers)
         print(row)
 
     print(f"{'═' * len(sep)}")
 
-    # Key interpretation guide
     print("""
   INTERPRETATION
   ──────────────
   Strategy A  — Hard gate: only stocks above MA100 and MA100 > MA200*0.97
-                This is what sheets_trader.py currently uses.
-                Blocks ALL entries in broad corrections.
+                 This is what sheets_trader.py currently uses.
+                 Blocks ALL entries in broad corrections.
 
   Strategy B  — Tiered gate: threshold scales with distance below MA100
-                Stocks at MA100 → threshold 0.25 (unchanged)
-                5% below MA100 → threshold 0.325
-                10% below MA100 → threshold 0.40
-                >30% below MA100 → hard block (same as A for falling knives)
-                Allows SOME entries in corrections; requires stronger signals.
+                 Stocks at MA100 → threshold 0.25 (unchanged)
+                 5% below MA100 → threshold 0.325
+                 10% below MA100 → threshold 0.40
+                 >30% below MA100 → hard block (same as A for falling knives)
+                 Allows SOME entries in corrections; requires stronger signals.
 
   Strategy C  — No filter: pure signal, 0.25 threshold everywhere
-                Upper bound on trade count; may buy into downtrends.
+                 Upper bound on trade count; may buy into downtrends.
 
   Calmar = CAGR / |MDD|  — higher is better (return per unit of drawdown)
 """)
 
-    # ── 5. Chart ──────────────────────────────────────────────────────────────
     outpath = RESULTS_DIR / "ma_filter_comparison.png"
     _plot(equity_curves, nifty, outpath)
 
