@@ -174,13 +174,13 @@ def setup(gc: gspread.Client):
     ws.update(SUMMARY_HDR, "A1")
 
     # Signal Radar tab
-    sr = _tab(T_SIGNALS, rows=50, cols=12)
+    sr = _tab(T_SIGNALS, rows=50, cols=13)
     sr.update([[
-        "As of", "Regime", "Entries Allowed", "Stocks Above MA100/200",
-        "", "Ticker", "Score", "Prev Score", "Close", "MA100", "MA200",
-        "MA Filter", "Blocked By",
+        "As of", "Regime", "Entries", "Stocks above MA100",
+        "Near threshold (>80%)", "Ticker", "Score", "Prev Score",
+        "Close", "MA100", "MA200", "Eff.Threshold", "Status",
     ]], "A1")
-    sr.freeze(rows=2)
+    sr.freeze(rows=1)
 
     # Remove default Sheet1 if it exists
     try: sh.del_worksheet(sh.worksheet("Sheet1"))
@@ -276,27 +276,33 @@ def _write_signal_radar(
             close_series = df["Close"] if isinstance(df["Close"], pd.Series) \
                            else df["Close"].iloc[:, 0]
             close = float(close_series.iloc[-1])
-            ma100 = float(close_series.rolling(100).mean().iloc[-1])
-            ma200 = float(close_series.rolling(200).mean().iloc[-1])
+            ma100 = float(close_series.rolling(100).mean().iloc[-1]) \
+                    if len(close_series) >= 100 else 0.0
+            ma200 = float(close_series.rolling(200).mean().iloc[-1]) \
+                    if len(close_series) >= 200 else 0.0
 
-            ma_pass = close > ma100 and ma100 > ma200 * 0.97
-            crossover = score_now >= SCORE_ENTRY and score_prev < SCORE_ENTRY
-
-            # Determine what's blocking this stock
-            if not regime_ok:
-                blocked = "Regime"
-            elif not ma_pass:
-                blocked = f"MA (close={close:.0f} < ma100={ma100:.0f})" \
-                          if close <= ma100 else f"MA (ma100={ma100:.0f} < ma200={ma200:.0f})"
-            elif not crossover:
-                if score_now >= SCORE_ENTRY:
-                    blocked = f"Already above thresh (no new crossover)"
-                elif score_now >= SCORE_ENTRY * 0.75:
-                    blocked = f"Near threshold ({score_now:.3f} vs {SCORE_ENTRY})"
-                else:
-                    blocked = f"Score too low ({score_now:.3f})"
+            # Tiered threshold
+            if ma100 > 0:
+                ma_gap  = (close - ma100) / ma100
+                penalty = max(0.0, -ma_gap) * 2.5
+                eff_thr = min(SCORE_ENTRY + penalty, 0.75)
             else:
-                blocked = "NONE — would fire if MA passes"  # shouldn't reach here
+                eff_thr = SCORE_ENTRY
+
+            crossover = score_now >= eff_thr and score_prev < eff_thr
+            pct_to_thr = (eff_thr - score_now) / eff_thr * 100  # % below threshold
+
+            if eff_thr >= 0.75:
+                blocked = f"Deeply below MA (thr={eff_thr:.2f})"
+            elif not crossover:
+                if score_now >= eff_thr:
+                    blocked = f"Already above thr={eff_thr:.3f} (no crossover)"
+                elif score_now >= eff_thr * 0.80:
+                    blocked = f"Near thr={eff_thr:.3f} ({pct_to_thr:.0f}% away)"
+                else:
+                    blocked = f"Score too low (need {eff_thr:.3f}, have {score_now:.3f})"
+            else:
+                blocked = "NONE — would fire"
 
             rows.append({
                 "ticker":    ticker,
@@ -305,7 +311,7 @@ def _write_signal_radar(
                 "close":     round(close, 2),
                 "ma100":     round(ma100, 2),
                 "ma200":     round(ma200, 2),
-                "ma_pass":   "✓" if ma_pass else "✗",
+                "eff_thr":   round(eff_thr, 3),
                 "blocked":   blocked,
                 "crossover": crossover,
             })
@@ -319,8 +325,8 @@ def _write_signal_radar(
     rows.sort(key=lambda r: -r["score"])
     top = rows[:top_n]
 
-    n_ma_pass    = sum(1 for r in rows if r["ma_pass"] == "✓")
-    n_near_thresh= sum(1 for r in rows if r["score"] >= SCORE_ENTRY * 0.75)
+    n_ma_above   = sum(1 for r in rows if r["close"] >= r["ma100"] and r["ma100"] > 0)
+    n_near_thresh= sum(1 for r in rows if r["score"] >= r["eff_thr"] * 0.80)
 
     try:
         ws = sh.worksheet(T_SIGNALS)
@@ -329,17 +335,16 @@ def _write_signal_radar(
 
     ws.clear()
 
-    # Header rows
     ws.update([[
-        "As of", "Regime", "Entries", "Stocks above MA100/200",
-        "Near threshold (>75%)", "", "", "", "", "", "", "", "",
+        "As of", "Regime", "Entries", "Stocks above MA100",
+        "Near threshold (>80%)", "", "", "", "", "", "", "", "",
     ]], "A1", value_input_option="USER_ENTERED")
 
     ws.update([[
         datetime.now().strftime("%Y-%m-%d %H:%M IST"),
         regime,
         "✓ OK" if regime_ok else "✗ BLOCKED",
-        f"{n_ma_pass} / {len(rows)}",
+        f"{n_ma_above} / {len(rows)}",
         str(n_near_thresh),
         "", "", "", "", "", "", "", "",
     ]], "A2", value_input_option="USER_ENTERED")
@@ -347,7 +352,7 @@ def _write_signal_radar(
     ws.update([[
         "", "", "", "", "",
         "Ticker", "Score", "Prev Score", "Close",
-        "MA100", "MA200", "MA Filter", "Blocked By",
+        "MA100", "MA200", "Eff.Threshold", "Status",
     ]], "A3", value_input_option="USER_ENTERED")
 
     # Format header rows
@@ -366,7 +371,6 @@ def _write_signal_radar(
     # Data rows
     data_rows = []
     for r in top:
-        # Colour-code: green if near threshold + MA passes, red if far away
         data_rows.append([
             "", "", "", "", "",
             r["ticker"],
@@ -375,7 +379,7 @@ def _write_signal_radar(
             r["close"],
             r["ma100"],
             r["ma200"],
-            r["ma_pass"],
+            r["eff_thr"],
             r["blocked"],
         ])
 
@@ -384,21 +388,19 @@ def _write_signal_radar(
 
         # Colour rows by proximity to firing
         for i, r in enumerate(top):
-            row_num = i + 4   # rows 1,2,3 are header
-            if r["ma_pass"] == "✓" and r["score"] >= SCORE_ENTRY * 0.80:
-                # Close to firing — green tint
-                bg = {"red": 0.05, "green": 0.20, "blue": 0.10}
-            elif r["ma_pass"] == "✗":
-                # MA filter blocking — red tint
-                bg = {"red": 0.20, "green": 0.05, "blue": 0.05}
+            row_num = i + 4
+            if r["score"] >= r["eff_thr"] * 0.90 and r["eff_thr"] < 0.75:
+                bg = {"red": 0.05, "green": 0.20, "blue": 0.10}   # green — close to firing
+            elif r["eff_thr"] >= 0.75:
+                bg = {"red": 0.20, "green": 0.05, "blue": 0.05}   # red — deeply below MA
             else:
-                # Default dark
-                bg = {"red": 0.07, "green": 0.07, "blue": 0.12}
+                bg = {"red": 0.07, "green": 0.07, "blue": 0.12}   # default
             ws.format(f"A{row_num}:M{row_num}", {"backgroundColor": bg})
 
-    log.info(f"[RADAR]  {n_ma_pass}/{len(rows)} stocks above MA  |  "
+    log.info(f"[RADAR]  {n_ma_above}/{len(rows)} stocks above MA100  |  "
              f"{n_near_thresh} near threshold  |  "
-             f"Top score: {rows[0]['score']:.3f} ({rows[0]['ticker']})")
+             f"Top score: {rows[0]['score']:.3f} ({rows[0]['ticker']}) "
+             f"eff_thr={rows[0]['eff_thr']:.3f}")
 
 
 def run_eod(sh: gspread.Spreadsheet, force: bool = False):
@@ -461,38 +463,41 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
         else:
             # Entry: adaptive crossover
             if regime_ok and score_now >= SCORE_ENTRY and score_prev < SCORE_ENTRY:
-                # ── Momentum quality filter ────────────────────────────────────
-                # Reject entries where the stock is in a structural downtrend.
-                # A stock below its 200-day MA in a declining trend should not
-                # be entered just because it has a local bounce signal.
-                # Require: close > 100-day SMA (medium-term uptrend confirmed)
+                # ── Tiered threshold filter ────────────────────────────────────
+                # No hard MA gate. Instead, threshold rises proportionally
+                # as price falls below MA100 (sensitivity=2.5):
+                #   At MA100:       threshold = 0.25
+                #   5% below MA100: threshold = 0.375
+                #   10% below:      threshold = 0.50
+                #   20% below:      threshold = 0.75 (effectively blocked)
                 try:
                     close_series = df["Close"] if isinstance(df["Close"], pd.Series) \
                                    else df["Close"].iloc[:, 0]
-                    ma100 = float(close_series.rolling(100).mean().iloc[-1])
-                    ma200 = float(close_series.rolling(200).mean().iloc[-1])
-                    # Price must be above MA100 and MA100 must be above MA200
-                    # (medium-term uptrend, not a bounce in a downtrend)
-                    in_uptrend = (close > ma100) and (ma100 > ma200 * 0.97)
-                    if not in_uptrend:
-                        log.debug(f"  {ticker}: rejected — below MA100/200 "
-                                  f"(close={close:.0f} ma100={ma100:.0f} ma200={ma200:.0f})")
-                        continue
+                    if len(close_series) >= 100:
+                        ma100 = float(close_series.rolling(100).mean().iloc[-1])
+                        ma_gap = (close - ma100) / ma100
+                        penalty = max(0.0, -ma_gap) * 2.5
+                        effective_threshold = min(SCORE_ENTRY + penalty, 0.75)
+                    else:
+                        effective_threshold = SCORE_ENTRY
                 except Exception:
-                    pass  # insufficient data for MA — allow through
+                    effective_threshold = SCORE_ENTRY
 
-                # Equal slot sizing: deploy 1/max_positions of capital per slot
-                slot_capital = MAX_CAPITAL / MAX_POSITIONS
-                shares       = max(1, int(slot_capital / close))
-                stop_level   = round(close - atr_v * ATR_TRAIL, 2)
-                if shares >= 1:
-                    pending_rows.append([
-                        ticker, date.today().isoformat(), "BUY",
-                        round(close, 2), shares, round(close * shares, 2),
-                        round(score_now, 4), round(atr_v, 2),
-                        f"score_entry stop={stop_level}",
-                        "", "",
-                    ])
+                if score_now >= effective_threshold and score_prev < effective_threshold:
+                    slot_capital = MAX_CAPITAL / MAX_POSITIONS
+                    shares       = max(1, int(slot_capital / close))
+                    stop_level   = round(close - atr_v * ATR_TRAIL, 2)
+                    ma_note      = f"thr={effective_threshold:.3f}" \
+                                   if effective_threshold > SCORE_ENTRY \
+                                   else "at_ma"
+                    if shares >= 1:
+                        pending_rows.append([
+                            ticker, date.today().isoformat(), "BUY",
+                            round(close, 2), shares, round(close * shares, 2),
+                            round(score_now, 4), round(atr_v, 2),
+                            f"score_entry stop={stop_level} {ma_note}",
+                            "", "",
+                        ])
 
     # Limit to available slots
     buys  = [r for r in pending_rows if r[2] == "BUY"]
