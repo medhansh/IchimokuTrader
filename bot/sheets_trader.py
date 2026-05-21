@@ -167,9 +167,9 @@ def setup(gc: gspread.Client):
         ws.clear()
         return ws
 
-    wh = _tab(T_HOLDINGS);  wh.update([HOLDINGS_HDR], "A1"); wh.freeze(rows=1)
-    wp = _tab(T_PENDING);   wp.update([PENDING_HDR], "A1");  wp.freeze(rows=1)
-    wt = _tab(T_TRANS);     wt.update([TRANS_HDR], "A1");    wt.freeze(rows=1)
+    wh = _tab(T_HOLDINGS, rows=2000);  wh.update([HOLDINGS_HDR], "A1"); wh.freeze(rows=1)
+    wp = _tab(T_PENDING,  rows=500);   wp.update([PENDING_HDR], "A1");  wp.freeze(rows=1)
+    wt = _tab(T_TRANS,    rows=5000);  wt.update([TRANS_HDR], "A1");    wt.freeze(rows=1)
     ws = _tab(T_SUMMARY, rows=30, cols=2)
     ws.update(SUMMARY_HDR, "A1")
 
@@ -238,6 +238,9 @@ def _fmt_header(ws: gspread.Worksheet, n: int):
 
 
 def _colour_row(ws: gspread.Worksheet, row: int, positive: bool):
+    # Expand sheet if the row exceeds current grid size
+    if row > ws.row_count:
+        ws.add_rows(max(100, row - ws.row_count + 50))
     n = ws.col_count
     import gspread.utils as gu
     end = gu.rowcol_to_a1(row, n).rstrip("0123456789")
@@ -635,7 +638,9 @@ def run_fill(sh: gspread.Spreadsheet, manual_prices_str: str | None = None, forc
                 round((value - cost) / cost * 100, 2) if cost else 0,
                 round(stop, 2), round(atr_v, 2), round(score, 4), "OPEN",
             ], value_input_option="USER_ENTERED")
-            _colour_row(wh, wh.row_count, positive=True)
+            # Get actual last filled row (not grid size)
+            last_row = len(wh.get_all_values())
+            _colour_row(wh, last_row, positive=True)
 
         elif action == "SELL":
             entry_cost = value
@@ -675,7 +680,8 @@ def run_fill(sh: gspread.Spreadsheet, manual_prices_str: str | None = None, forc
             f"{(pnl/value*100):.2f}%" if action == "SELL" else "",
             reason, round(cum_pnl, 2), round(cum_slippage, 2),
         ], value_input_option="USER_ENTERED")
-        _colour_row(wt, wt.row_count, positive=pnl >= 0)
+        last_row_t = len(wt.get_all_values())
+        _colour_row(wt, last_row_t, positive=pnl >= 0)
 
         filled += 1
         log.info(f"  ✓ {action} {ticker}: "
