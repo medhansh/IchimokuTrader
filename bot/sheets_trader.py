@@ -512,17 +512,28 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
     # Update current prices for open positions
     _update_prices(sh, data)
 
-    # Write Pending tab
+    # Write Pending tab — preserve any unfilled orders from previous EOD
+    # (can happen if fill run failed or crashed before processing)
+    existing_pending = _read(sh, T_PENDING)
+    carried_rows = []
+    if not existing_pending.empty and "Action" in existing_pending.columns:
+        unfilled = existing_pending[existing_pending["Action"].isin(["BUY", "SELL"])]
+        if not unfilled.empty:
+            log.warning(f"  {len(unfilled)} unfilled orders carried over from previous EOD")
+            carried_rows = unfilled.values.tolist()
+
     wp = sh.worksheet(T_PENDING)
     wp.clear()
     wp.update([PENDING_HDR], "A1")
     _fmt_header(wp, len(PENDING_HDR))
-    if pending_rows:
-        wp.append_rows(pending_rows, value_input_option="USER_ENTERED")
+
+    all_pending = carried_rows + pending_rows
+    if all_pending:
+        wp.append_rows(all_pending, value_input_option="USER_ENTERED")
         import gspread.utils as gu
         fill_col = PENDING_HDR.index("Fill Price (leave blank for auto-fetch)") + 1
         col_letter = gu.rowcol_to_a1(1, fill_col).rstrip("0123456789")
-        wp.format(f"{col_letter}2:{col_letter}{len(pending_rows)+1}", {
+        wp.format(f"{col_letter}2:{col_letter}{len(all_pending)+1}", {
             "backgroundColor": {"red": 1.0, "green": 0.9, "blue": 0.0},
             "textFormat": {"bold": True,
                            "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}},
@@ -538,16 +549,41 @@ def run_eod(sh: gspread.Spreadsheet, force: bool = False):
 
 
 def _update_prices(sh: gspread.Spreadsheet, data: dict):
-    """Refresh Current Price column for open positions."""
+    """Refresh Current Price, Market Value, Unrealized PnL and Return % for open positions."""
     wh  = sh.worksheet(T_HOLDINGS)
     df  = _read(sh, T_HOLDINGS)
     if df.empty:
         return
+
+    # Column indices (1-based) from HOLDINGS_HDR:
+    # A=Ticker, B=EntryDate, C=FillPrice, D=SignalPrice, E=Shares,
+    # F=Cost(₹), G=CurrentPrice, H=MarketValue, I=UnrealizedPnL, J=Return%
     updates = []
     for i, row in df.iterrows():
-        if row.get("Status") == "OPEN" and row["Ticker"] in data:
-            price = float(data[row["Ticker"]]["Close"].iloc[-1])
-            updates.append({"range": f"G{i+2}", "values": [[round(price, 2)]]})
+        if row.get("Status") != "OPEN":
+            continue
+        ticker = row["Ticker"]
+        if ticker not in data:
+            continue
+        try:
+            current_px = float(data[ticker]["Close"].iloc[-1])
+            shares     = int(float(row.get("Shares", 0) or 0))
+            cost       = float(row.get("Cost (₹)", 0) or 0)
+
+            market_val = round(current_px * shares, 2)
+            unr_pnl    = round(market_val - cost, 2)
+            ret_pct    = round(unr_pnl / cost * 100, 2) if cost else 0
+
+            row_num = i + 2   # +1 for 0-index, +1 for header row
+            updates.extend([
+                {"range": f"G{row_num}", "values": [[current_px]]},
+                {"range": f"H{row_num}", "values": [[market_val]]},
+                {"range": f"I{row_num}", "values": [[unr_pnl]]},
+                {"range": f"J{row_num}", "values": [[ret_pct]]},
+            ])
+        except Exception as e:
+            log.debug(f"  _update_prices: {ticker} failed: {e}")
+
     if updates:
         wh.batch_update(updates, value_input_option="USER_ENTERED")
 
