@@ -174,7 +174,7 @@ def setup(gc: gspread.Client):
     ws.update(SUMMARY_HDR, "A1")
 
     # Signal Radar tab
-    sr = _tab(T_SIGNALS, rows=50, cols=13)
+    sr = _tab(T_SIGNALS, rows=120, cols=14)
     sr.update([[
         "As of", "Regime", "Entries", "Stocks above MA100",
         "Near threshold (>80%)", "Ticker", "Score", "Prev Score",
@@ -250,6 +250,249 @@ def _colour_row(ws: gspread.Worksheet, row: int, positive: bool):
 
 
 # ── EOD MODE ───────────────────────────────────────────────────────────────────
+
+def _trailing_stop(fill_price: float, peak_price: float, atr_v: float) -> float:
+    """Return the current trailing stop level based on peak price seen since entry."""
+    stop_from_entry = fill_price - ATR_TRAIL * atr_v
+    stop_from_peak  = peak_price - ATR_TRAIL * atr_v
+    # Stop never moves down — so it's the max of entry-based and peak-based
+    return round(max(stop_from_entry, stop_from_peak), 2)
+
+
+def _write_exit_monitor(
+    sh:           gspread.Spreadsheet,
+    data:         dict,
+    ws:           gspread.Worksheet,
+    start_row:    int,
+) -> int:
+    """
+    Append an 'Exit Monitor' section to the Signal Radar tab starting at
+    `start_row`.  Shows every open position's:
+        - Current price, stop level, distance to stop (%)
+        - Current score, distance to score-exit threshold (-0.25)
+        - ATR (current, used to compute updated trailing stop)
+        - Trailing stop updated from today's high (peak price approximation)
+        - Alert status: CRITICAL / WARNING / OK
+
+    Also writes the updated trailing stop back to the Holdings tab.
+
+    Returns the next available row number after writing.
+    """
+    holdings_df = _read(sh, T_HOLDINGS)
+    if holdings_df.empty:
+        return start_row
+
+    open_pos = holdings_df[holdings_df.get("Status", pd.Series()) == "OPEN"].copy()
+    if open_pos.empty:
+        return start_row
+
+    # ── Section header ────────────────────────────────────────────────────────
+    ws.update([[
+        "EXIT MONITOR — Open Positions",
+        "", "", "", "", "", "", "", "", "", "", "", "", "",
+    ]], f"A{start_row}", value_input_option="USER_ENTERED")
+    ws.format(f"A{start_row}:N{start_row}", {
+        "backgroundColor": {"red": 0.10, "green": 0.04, "blue": 0.04},
+        "textFormat": {
+            "bold": True,
+            "fontSize": 11,
+            "foregroundColor": {"red": 1.0, "green": 0.4, "blue": 0.4},
+        },
+    })
+
+    col_header_row = start_row + 1
+    ws.update([[
+        "Ticker", "Entry Price", "Current Price", "Peak (High)", "ATR",
+        "Stop (Stored)", "Stop (Updated)", "Dist to Stop %",
+        "Score", "Prev Score", "Score Exit Thr", "Dist to Score Exit",
+        "Days Held", "Status",
+    ]], f"A{col_header_row}", value_input_option="USER_ENTERED")
+    ws.format(f"A{col_header_row}:N{col_header_row}", {
+        "backgroundColor": {"red": 0.07, "green": 0.07, "blue": 0.12},
+        "textFormat": {
+            "bold": True,
+            "foregroundColor": {"red": 0.0, "green": 0.83, "blue": 0.67},
+        },
+        "horizontalAlignment": "CENTER",
+    })
+
+    data_start = col_header_row + 1
+    exit_rows = []
+    holdings_stop_updates = []   # (row_num_in_sheet, new_stop)
+
+    wh = sh.worksheet(T_HOLDINGS)
+    all_h_rows = wh.get_all_values()   # for row-number lookup
+
+    for _, pos in open_pos.iterrows():
+        ticker = str(pos.get("Ticker", "")).strip().upper()
+        if not ticker or ticker not in data:
+            continue
+
+        try:
+            df_tick = data[ticker]
+
+            # ── Prices ──────────────────────────────────────────────────────
+            close_s  = df_tick["Close"] if isinstance(df_tick["Close"], pd.Series) \
+                       else df_tick["Close"].iloc[:, 0]
+            high_s   = df_tick["High"]  if isinstance(df_tick["High"], pd.Series) \
+                       else df_tick["High"].iloc[:, 0]
+
+            current_px = float(close_s.iloc[-1])
+            today_high = float(high_s.iloc[-1])
+
+            fill_price = float(pos.get("Fill Price", 0) or 0)
+            stored_stop = None
+            try:
+                stored_stop = float(pos.get("Stop Level", 0) or 0)
+            except Exception:
+                pass
+
+            # ── ATR (current) ────────────────────────────────────────────────
+            atr_v = atr_latest(df_tick)
+
+            # ── Peak price estimate ─────────────────────────────────────────
+            # Best proxy: max(today's high, current price, stored_stop + 2.5×ATR)
+            # The stored stop already encodes the peak at last EOD:
+            #   stored_stop = peak_at_eod - 2.5 × atr_at_eod
+            # So: implied_eod_peak = stored_stop + atr_v * ATR_TRAIL
+            implied_peak = (stored_stop + atr_v * ATR_TRAIL) if stored_stop else fill_price
+            # Today's high may have pushed price above the EOD-implied peak
+            peak_price = max(implied_peak, today_high, current_px)
+
+            # ── Updated trailing stop ────────────────────────────────────────
+            updated_stop = _trailing_stop(fill_price, peak_price, atr_v)
+            # Stored stop acts as a floor (never move stop down between EOD runs)
+            if stored_stop and updated_stop < stored_stop:
+                updated_stop = stored_stop
+
+            # ── Distance to stop ────────────────────────────────────────────
+            dist_to_stop_pct = (current_px - updated_stop) / current_px * 100
+
+            # ── Score ────────────────────────────────────────────────────────
+            score_now, score_prev = adaptive_latest_score(df_tick)
+            dist_to_score_exit = score_now - SCORE_EXIT_THRESH   # positive = safe margin
+
+            # ── Days held ────────────────────────────────────────────────────
+            days_held = ""
+            try:
+                entry_date = pd.to_datetime(pos.get("Entry Date", ""))
+                days_held  = (pd.Timestamp.today() - entry_date).days
+            except Exception:
+                pass
+
+            # ── Alert status ─────────────────────────────────────────────────
+            stop_critical  = dist_to_stop_pct  < 1.0
+            stop_warning   = dist_to_stop_pct  < 3.0
+            score_critical = dist_to_score_exit < 0.05
+            score_warning  = dist_to_score_exit < 0.15
+
+            if stop_critical or score_critical:
+                status = "🔴 CRITICAL"
+            elif stop_warning or score_warning:
+                status = "🟡 WARNING"
+            else:
+                status = "🟢 OK"
+
+            exit_rows.append({
+                "ticker":           ticker,
+                "fill_price":       round(fill_price, 2),
+                "current_px":       round(current_px, 2),
+                "peak_price":       round(peak_price, 2),
+                "atr":              round(atr_v, 2),
+                "stored_stop":      round(stored_stop, 2) if stored_stop else "",
+                "updated_stop":     updated_stop,
+                "dist_stop_pct":    round(dist_to_stop_pct, 2),
+                "score_now":        round(score_now, 4),
+                "score_prev":       round(score_prev, 4),
+                "score_exit_thr":   SCORE_EXIT_THRESH,
+                "dist_score_exit":  round(dist_to_score_exit, 4),
+                "days_held":        days_held,
+                "status":           status,
+                "stop_critical":    stop_critical,
+                "stop_warning":     stop_warning,
+                "score_critical":   score_critical,
+                "score_warning":    score_warning,
+                "updated_stop_raw": updated_stop,
+            })
+
+            # ── Queue stop update in Holdings ────────────────────────────────
+            for ri, row in enumerate(all_h_rows):
+                if ri == 0:
+                    continue
+                if row[0] == ticker and (len(row) < 14 or row[13] == "OPEN"):
+                    # Column K (index 10) = Stop Level  (1-based → col 11)
+                    holdings_stop_updates.append((ri + 1, updated_stop))
+                    break
+
+        except Exception as e:
+            log.debug(f"  ExitMonitor: {ticker} failed: {e}")
+
+    # ── Write exit monitor rows ───────────────────────────────────────────────
+    if exit_rows:
+        # Sort: CRITICAL first, then WARNING, then OK; within each by dist_stop_pct asc
+        priority = {"🔴 CRITICAL": 0, "🟡 WARNING": 1, "🟢 OK": 2}
+        exit_rows.sort(key=lambda r: (priority.get(r["status"], 9), r["dist_stop_pct"]))
+
+        sheet_rows = []
+        for r in exit_rows:
+            sheet_rows.append([
+                r["ticker"],
+                r["fill_price"],
+                r["current_px"],
+                r["peak_price"],
+                r["atr"],
+                r["stored_stop"],
+                r["updated_stop"],
+                f"{r['dist_stop_pct']:+.2f}%",
+                r["score_now"],
+                r["score_prev"],
+                r["score_exit_thr"],
+                r["dist_score_exit"],
+                r["days_held"],
+                r["status"],
+            ])
+
+        ws.update(sheet_rows, f"A{data_start}", value_input_option="USER_ENTERED")
+
+        # Colour rows by alert level
+        for i, r in enumerate(exit_rows):
+            row_num = data_start + i
+            if r["stop_critical"] or r["score_critical"]:
+                bg = {"red": 0.25, "green": 0.04, "blue": 0.04}   # deep red
+            elif r["stop_warning"] or r["score_warning"]:
+                bg = {"red": 0.22, "green": 0.16, "blue": 0.02}   # amber
+            else:
+                bg = {"red": 0.04, "green": 0.15, "blue": 0.08}   # green
+            ws.format(f"A{row_num}:N{row_num}", {"backgroundColor": bg})
+
+        next_row = data_start + len(exit_rows)
+    else:
+        ws.update([["(no open positions)"]], f"A{data_start}",
+                  value_input_option="USER_ENTERED")
+        next_row = data_start + 1
+
+    # ── Flush trailing stop updates to Holdings ───────────────────────────────
+    if holdings_stop_updates:
+        stop_batch = [
+            {"range": f"K{row_num}", "values": [[new_stop]]}
+            for row_num, new_stop in holdings_stop_updates
+        ]
+        try:
+            wh.batch_update(stop_batch, value_input_option="USER_ENTERED")
+            log.info(f"[EXIT MONITOR]  Updated trailing stops for "
+                     f"{len(holdings_stop_updates)} positions in Holdings tab")
+        except Exception as e:
+            log.warning(f"  Could not update trailing stops in Holdings: {e}")
+
+    # Summary log line
+    n_crit = sum(1 for r in exit_rows if r["stop_critical"] or r["score_critical"])
+    n_warn = sum(1 for r in exit_rows if not (r["stop_critical"] or r["score_critical"])
+                 and (r["stop_warning"] or r["score_warning"]))
+    log.info(f"[EXIT MONITOR]  {len(exit_rows)} open positions  |  "
+             f"{n_crit} CRITICAL  |  {n_warn} WARNING")
+
+    return next_row + 1   # blank separator row
+
 
 def _write_signal_radar(
     sh:         gspread.Spreadsheet,
@@ -334,9 +577,12 @@ def _write_signal_radar(
     try:
         ws = sh.worksheet(T_SIGNALS)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(T_SIGNALS, rows=50, cols=13)
+        ws = sh.add_worksheet(T_SIGNALS, rows=120, cols=14)
 
     ws.clear()
+    # Ensure enough columns for exit monitor (14 columns, A:N)
+    if ws.col_count < 14:
+        ws.resize(cols=14)
 
     ws.update([[
         "As of", "Regime", "Entries", "Stocks above MA100",
@@ -404,6 +650,12 @@ def _write_signal_radar(
              f"{n_near_thresh} near threshold  |  "
              f"Top score: {rows[0]['score']:.3f} ({rows[0]['ticker']}) "
              f"eff_thr={rows[0]['eff_thr']:.3f}")
+
+    # ── Exit Monitor section ─────────────────────────────────────────────
+    # Appended below the entry candidates on the same tab.
+    # Also writes updated trailing stops back to the Holdings tab.
+    exit_section_start = len(top) + 4 + 2   # header rows + data rows + 2 blank separator
+    _write_exit_monitor(sh, data, ws, exit_section_start)
 
 
 def run_eod(sh: gspread.Spreadsheet, force: bool = False):
